@@ -27,9 +27,12 @@ The two percentages are the last to go. A window that has reset since it was las
 ## Where the numbers come from
 
 - **Each reply.** Claude Code reads your rate-limit windows from every model response. The band takes each new reading in as soon as it arrives.
-- **The account usage endpoint.** This is `GET https://api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` reads. The band asks it once a minute, using the session's own login. This picks up usage from your other sessions and from claude.ai.
-  - **Throttling:** on a 429, a 403 or a rate-limit body, the band waits as long as `Retry-After` says, or 5 minutes, as Claude Code does.
-  - **Errors:** a server error waits 2 minutes. A 404 stops it asking for the rest of the session.
+- **The account usage endpoint.** This is `GET https://api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` reads, asked with the session's own login. It picks up usage from your other sessions and from claude.ai.
+  - **Cadence:** it is asked every 3 minutes, by all your sessions together. Measured on 2026-10-10, the endpoint's edge lets about one request through every two minutes per login, after a short burst. That allowance is shared with every other caller, Claude Code's own `/usage` included. Polling once a minute was refused after every 4–6 requests.
+  - **One reading for every session:** sessions take turns through `~/.claude/usage-stats/endpoint.json` (under `CLAUDE_CONFIG_DIR` if set). The session whose turn it is asks, and writes the answer and any backoff there. Every other session takes that reading in. A turn left unfinished, say by a session that quit mid-request, passes to another after 45 seconds.
+  - **Throttling:** a 429, a 403 with no error body, or a rate-limit body waits as long as `Retry-After` says, or 5 minutes, as Claude Code does. The endpoint's own 429s say `retry-after: 0`, so in practice that's 5 minutes.
+  - **Refused login:** a 401, or a 403 with an error body, waits an hour, as Claude Code does. So does a 404.
+  - **Other errors:** a server error or a failed request waits 2 minutes.
   - **Undocumented:** this endpoint is not a public API and may change.
 - **Redraws.** The band redraws every 3 seconds, so countdowns stay current.
 
@@ -39,9 +42,10 @@ You need to be signed in with a Claude subscription (Pro, Max, Team or Enterpris
 
 | Command | What it does |
 | --- | --- |
-| `/usage-stats` or `/usage-stats refresh` | Prints the figures. Asks the endpoint unless it is throttling you. |
-| `/usage-stats hide` | Hides the band and stops asking the endpoint. The setting is remembered across sessions. |
+| `/usage-stats` | Prints the figures, how old the endpoint reading is, and when the next read is due. It never asks ahead of the shared cadence. |
+| `/usage-stats hide` | Hides the band. This session stops asking the endpoint. The setting is remembered across sessions. |
 | `/usage-stats show` | Brings the band back. |
+| `/usage-stats debug` | Shows the shared turn and this session's requests: time, status, latency and rate-limit headers, never the credential. |
 
 ## Install
 

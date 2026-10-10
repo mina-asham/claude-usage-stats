@@ -18,6 +18,7 @@ const HOUR = 60 * MINUTE
 const NOW = Date.UTC(2026, 9, 10, 14, 0)
 const SURFACES = ['terminal', 'desktop'] as const
 const URL = 'https://api.anthropic.com/api/oauth/usage'
+const SHARED = '/home/test/.claude/usage-stats/endpoint.json'
 
 const iso = (ms: number) => new Date(ms).toISOString()
 
@@ -43,13 +44,29 @@ type World = {
   isLoggedIn?: boolean
   /** How long each request takes, on the mocked clock. */
   delayMs?: number
+  /** What another session left in the shared file. */
+  shared?: unknown
 }
 
 function world(on: On, options: World = {}) {
   const clock = mock.clock(on, { now: NOW })
   mock.store(on)
+  mock.env(on, { HOME: '/home/test' })
   const fetched: number[] = []
   let api: unknown = options.api ?? API_BODY
+  const files = new Map<string, string>()
+  if (options.shared !== undefined) files.set(SHARED, JSON.stringify(options.shared))
+
+  on('fs.read', ($, e) => {
+    const text = files.get(e.path)
+
+    return text === undefined ? { deny: `ENOENT: ${e.path}` } : { value: text }
+  })
+  on('fs.write', ($, e) => {
+    files.set(e.path, e.text)
+
+    return { value: undefined }
+  })
 
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
@@ -74,7 +91,12 @@ function world(on: On, options: World = {}) {
     return <Text>engine band</Text>
   })
 
-  return { clock, fetched, setApi: (next: unknown) => (api = next) }
+  return {
+    clock,
+    fetched,
+    setApi: (next: unknown) => (api = next),
+    shared: () => JSON.parse(files.get(SHARED) ?? 'null') as Record<string, unknown> | null,
+  }
 }
 
 const START = { cwd: '/tmp', surface: 'desktop' as const, isInteractive: true }
@@ -261,8 +283,9 @@ describe('band', () => {
   })
 
   test('stays on one line however narrow, the figures last to go', async ($, on) => {
-    world(on, { live: LIVE })
+    world(on)
     await $.session.start(START)
+    await $.session.measure({ context: { window: 200_000 }, rateLimits: LIVE, changed: ['rateLimits'] })
 
     for (const columns of [160, 70, 60, 40, 25]) {
       const ui = await $.ui.mount(band('desktop', columns))
@@ -295,28 +318,92 @@ describe('band', () => {
     expect(await ui.find({ type: 'Text', text: 'Week · Opus' })).toBeUndefined()
   })
 
-  test('redraws every 3 seconds and asks the endpoint once a minute', async ($, on) => {
-    const { clock, fetched, setApi } = world(on, { live: LIVE })
+  test('redraws every 3 seconds and asks the endpoint every three minutes', async ($, on) => {
+    const { clock, fetched, setApi, shared } = world(on, { live: LIVE })
     await $.session.start(START)
     const ui = await $.ui.mount(band('desktop'))
 
     await clock.advance(1)
     expect(fetched).toEqual([1])
+    expect(shared()).toMatchObject({ nextAt: NOW + 1 + 3 * MINUTE, wait: 'answered', answer: { at: NOW + 1 } })
     expect(await ui.find({ type: 'Text', text: /\(3h\)$/ })).toBeDefined()
 
     setApi({ ...API_BODY, five_hour: { utilization: 13, resets_at: API_BODY.five_hour.resets_at } })
-    await clock.advance(3_000)
+    await clock.advance(60_000)
     expect(fetched).toEqual([1])
-    await clock.advance(57_000)
     expect(await ui.find({ type: 'Text', text: /\(2h 59m\)$/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: '12%' })).toBeDefined()
 
-    await clock.advance(3_000)
-    expect(fetched).toEqual([1, 63_000])
+    await clock.advance(123_000)
+    expect(fetched).toEqual([1, 183_000])
     expect(await ui.find({ type: 'Text', text: '13%' })).toBeDefined()
 
     await clock.advance(10 * MINUTE)
-    expect(fetched).toHaveLength(12)
+    expect(fetched).toEqual([1, 183_000, 363_000, 543_000, 723_000])
+  })
+
+  test("takes in another session's recent answer instead of asking", async ($, on) => {
+    const other = parseUsage({ ...API_BODY, five_hour: { utilization: 55, resets_at: API_BODY.five_hour.resets_at } })
+    const { clock, fetched } = world(on, {
+      shared: { nextAt: NOW + 100_000, wait: 'answered', answer: { at: NOW - 20_000, windows: other } },
+    })
+    await $.session.start(START)
+    await clock.advance(1)
+    const ui = await $.ui.mount(band('desktop', 200))
+
+    expect(fetched).toEqual([])
+    expect(await ui.find({ type: 'Text', text: '55%' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Week · Sonnet' })).toBeDefined()
+
+    await clock.advance(99_000)
+    expect(fetched).toEqual([])
+    await clock.advance(3_000)
+    expect(fetched).toEqual([102_000])
+  })
+
+  test('a reading carried over from an earlier process never outranks a timestamped one', async ($, on) => {
+    const older = parseUsage({ ...API_BODY, five_hour: { utilization: 35, resets_at: API_BODY.five_hour.resets_at } })
+    const { clock, fetched } = world(on, {
+      live: [{ kind: 'five_hour', percentUsed: 17, resetsAt: API_BODY.five_hour.resets_at }],
+      shared: { nextAt: NOW + 100_000, wait: 'answered', answer: { at: NOW - 100_000, windows: older } },
+    })
+    await $.session.start(START)
+    const before = await $.ui.mount(band('desktop'))
+    expect(await before.find({ type: 'Text', text: '17%' })).toBeDefined()
+    expect(await before.find({ type: 'Text', text: 'age unknown' })).toBeDefined()
+    await before.unmount()
+
+    await clock.advance(1)
+    const ui = await $.ui.mount(band('desktop'))
+    expect(fetched).toEqual([])
+    expect(await ui.find({ type: 'Text', text: '35%' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'age unknown' })).toBeUndefined()
+  })
+
+  test("takes over the turn once another session's claim goes stale", async ($, on) => {
+    const { clock, fetched } = world(on, {
+      live: LIVE,
+      shared: { nextAt: NOW + 45_000, wait: 'asking', claimedBy: 'other' },
+    })
+    await $.session.start(START)
+    await clock.advance(1)
+    await clock.advance(42_000)
+    expect(fetched).toEqual([])
+    await clock.advance(3_000)
+    expect(fetched).toEqual([45_000])
+  })
+
+  test("shares a throttle: no session asks until it is over", async ($, on) => {
+    const { clock, fetched } = world(on, {
+      live: LIVE,
+      shared: { nextAt: NOW + 4 * MINUTE, wait: 'throttled', error: 'the usage endpoint is rate limiting' },
+    })
+    await $.session.start(START)
+    await clock.advance(1)
+    const { text } = await $.command.run({ command: 'usage-stats', args: '', ...RUN })
+    expect(text).toMatch(/\(the usage endpoint is rate limiting; next read in 4m\)$/)
+    await clock.advance(4 * MINUTE)
+    expect(fetched).toEqual([4 * MINUTE])
   })
 
   test('never has two requests out at once', async ($, on) => {
@@ -329,10 +416,26 @@ describe('band', () => {
     expect(fetched).toEqual([1])
 
     await clock.advance(5_000)
-    const asked = $.command.run({ command: 'usage-stats', args: 'refresh', ...RUN })
-    await clock.advance(5_000)
-    await asked
-    expect(fetched).toEqual([1, 5_001])
+    expect(fetched).toEqual([1])
+  })
+
+  test('the command never asks ahead of the shared turn', async ($, on) => {
+    const { clock, fetched } = world(on, { live: LIVE })
+    await $.session.start(START)
+    await clock.advance(1)
+    expect(fetched).toEqual([1])
+
+    const first = await $.command.run({ command: 'usage-stats', args: '', ...RUN })
+    const second = await $.command.run({ command: 'usage-stats', args: 'refresh', ...RUN })
+    expect(fetched).toEqual([1])
+    expect(first.text).toMatch(/^Session: 12% used/)
+    expect(first.text).toMatch(/\(usage endpoint read just now; next read in 3m\)$/)
+    expect(second.text).toBe(first.text)
+
+    const { text } = await $.command.run({ command: 'usage-stats', args: 'debug', ...RUN })
+    expect(text).toBe(
+      'Shared turn: answered, next read in 3m.\nRequests this session sent (1, oldest first):\njust now  start  200  0ms',
+    )
   })
 
   test('pauses while the band is hidden', async ($, on) => {
@@ -377,13 +480,14 @@ describe('band', () => {
     expect(await ui.find({ type: 'Text', text: 'Week · Sonnet' })).toBeDefined()
 
     setApi({ ...API_BODY, seven_day_sonnet: null })
-    await clock.advance(63_000)
+    await clock.advance(183_000)
     expect(await ui.find({ type: 'Text', text: 'Week · Sonnet' })).toBeUndefined()
   })
 
   test('a window shows a dash once it resets with no new reading', async ($, on) => {
-    const { clock, fetched } = world(on, { live: LIVE, isLoggedIn: false })
+    const { clock, fetched } = world(on, { isLoggedIn: false })
     await $.session.start(START)
+    await $.session.measure({ context: { window: 200_000 }, rateLimits: LIVE, changed: ['rateLimits'] })
     await clock.advance(113 * MINUTE)
     const ui = await $.ui.mount(band('desktop'))
 
@@ -444,7 +548,7 @@ describe('band', () => {
       expect(await ui.find({ type: 'Text', text: /unavailable: the usage endpoint is rate limiting/ })).toBeDefined()
 
       const { text } = await $.command.run({ command: 'usage-stats', args: 'refresh', ...RUN })
-      expect(text).toMatch(/rate limiting; asking again in 5m/)
+      expect(text).toMatch(/\(the usage endpoint is rate limiting; next read in 5m\)/)
       expect(fetched).toEqual([1])
 
       await clock.advance(5 * MINUTE)
@@ -454,17 +558,34 @@ describe('band', () => {
     })
   }
 
-  test('stops asking once the endpoint is not there', async ($, on) => {
+  test('waits an hour when the endpoint is not there', async ($, on) => {
     const { clock, fetched } = world(on, { live: LIVE, status: 404 })
     await $.session.start(START)
     await clock.advance(1)
-    await clock.advance(30 * MINUTE)
+    await clock.advance(59 * MINUTE)
+    expect(fetched).toEqual([1])
+    await clock.advance(MINUTE + 3_000)
+    expect(fetched).toHaveLength(2)
+  })
+
+  test('waits an hour when the login is refused (a 401, or a 403 with an error body)', async ($, on) => {
+    const { clock, fetched } = world(on, {
+      live: LIVE,
+      status: 403,
+      api: { type: 'error', error: { type: 'permission_error', message: 'no profile scope' } },
+    })
+    await $.session.start(START)
+    await clock.advance(1)
+    const { text } = await $.command.run({ command: 'usage-stats', args: '', ...RUN })
+    expect(text).toMatch(/\(the usage endpoint refused the login; next read in 1h\)$/)
+    await clock.advance(59 * MINUTE)
     expect(fetched).toEqual([1])
   })
 
   test('keeps the age marker in view when a reading is old, before the meters', async ($, on) => {
-    const { clock } = world(on, { live: LIVE, status: 404 })
+    const { clock } = world(on, { status: 404 })
     await $.session.start(START)
+    await $.session.measure({ context: { window: 200_000 }, rateLimits: LIVE, changed: ['rateLimits'] })
     await clock.advance(10 * MINUTE)
 
     const ui = await $.ui.mount(band('desktop', 90))

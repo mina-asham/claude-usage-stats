@@ -317,6 +317,18 @@ export function formatAge(ms: number): string {
   return `${formatCountdown(ms)} ago`
 }
 
+/**
+ * The read time of a figure whose age is unknown: the session's own reading at
+ * start, which Claude Code may carry over from an earlier process. Older than
+ * any timestamped reading, so any of those wins over it.
+ */
+export const UNKNOWN_READ_AT = 1
+
+/** Whether a snapshot's newest reading has a known time. */
+export function isAgeKnown(snapshot: UsageSnapshot): boolean {
+  return snapshot.observedAt > UNKNOWN_READ_AT
+}
+
 /** Cells a meter takes on the line: ten block characters, or a 72 px SVG at about 7 px a cell. */
 export const METER_CELLS = 10
 /** Cells between two windows on the line. */
