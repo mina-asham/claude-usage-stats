@@ -1,0 +1,11 @@
+{
+  "name": "usage-stats",
+  "version": "0.1.0",
+  "description": "Shows your Claude plan usage above the prompt: current session (5h) and weekly percentage used, with reset times.",
+  "author": {
+    "name": "Mina Asham",
+    "url": "https://github.com/mina-asham"
+  },
+  "repository": "https://github.com/mina-asham/claude-usage-stats",
+  "types": "./types/index.d.ts"
+}

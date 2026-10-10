@@ -1,0 +1,17 @@
+{
+  "name": "claude-usage-stats",
+  "owner": {
+    "name": "Mina Asham",
+    "url": "https://github.com/mina-asham"
+  },
+  "metadata": {
+    "description": "A Claude Code mod that shows your plan usage (session and weekly) above the prompt."
+  },
+  "plugins": [
+    {
+      "name": "usage-stats",
+      "source": "./",
+      "description": "Plan usage above the prompt: session (5h) and weekly percentage, with reset times."
+    }
+  ]
+}
